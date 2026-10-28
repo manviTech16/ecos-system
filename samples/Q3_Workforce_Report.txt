@@ -1,0 +1,22 @@
+Q3 2026 Workforce Productivity Report
+
+Executive Summary
+This report reviews workforce productivity and project delivery across all departments for the third quarter of 2026. It draws on task records, assignment data and resource logs for 150 employees working on 50 projects. Overall delivery improved, but workload is unevenly distributed and several high-priority tasks remain at risk.
+
+Introduction
+Management commissioned this review after a rise in delayed projects during the second quarter. The scope covers Software Development, QA, Data Analytics and Operations. Data was collected between July 1 and September 30, 2026.
+
+Key Findings
+Task completion rose to 62% in Q3, up from 54% in Q2, a gain of 8 percentage points. The Software Development department completed 1,240 tasks, which is 31% more than in the previous quarter. Average employee workload was 23%, but 12 employees carried more than 40% of their capacity. Our analysis revealed that 18% of blocked tasks were waiting on resources rather than people. GPU resources averaged 94% utilization, which exceeded the planning threshold of 85%. Customer-facing projects missed their deadlines 2.4 times more often than internal projects (p < 0.05). Contact the analytics lead at maria.silva@example.com or 415-555-0199 for the raw data.
+
+Analysis
+The data shows that delays concentrate in projects that depend on shared hardware. Teams with fewer than 5 members delivered 14% faster than larger teams. Reassigning tasks to employees with matching skills reduced average task duration from 9.1 days to 7.4 days.
+
+Conclusions
+In conclusion, productivity gains in Q3 were real but fragile. Resource contention, not headcount, is the main driver of delay. Therefore, the organisation should treat shared hardware as the critical constraint when planning Q4 delivery.
+
+Recommendations
+We recommend adding two GPU nodes before the end of October to bring utilization below 85%.
+Managers should rebalance work away from the 12 overloaded employees within the next 30 days.
+The PMO must review all blocked high-priority tasks every week.
+Consider adopting skill-based assignment for all new tasks, since it cut task duration by 19%.

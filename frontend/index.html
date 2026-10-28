@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>ECOS — Enterprise Collaboration Optimization System</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<style>
+:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html,body{height:100%;margin:0}body{font-family:Manrope,system-ui,sans-serif;background:#f5f6fb;color:#14213d}
+.card{background:#fff;border:1px solid #e6e9f2;border-radius:12px;box-shadow:0 1px 2px rgba(20,33,61,.04),0 4px 12px rgba(20,33,61,.04)}
+.th{cursor:pointer;user-select:none}
+@media print{html,body,#root>div,main{height:auto!important;overflow:visible!important}aside,header,.noprint{display:none!important}body{background:#fff}.card{box-shadow:none;break-inside:avoid}}
+@keyframes slide{from{transform:translateX(24px);opacity:0}to{transform:none;opacity:1}}.panel{animation:slide .18s ease-out}
+</style></head><body><div id="root"></div>
+<script type="text/babel">
+const {useState,useMemo,useEffect}=React;
+/* ---------- API client: talks to the ECOS backend (server.py) ---------- */
+const BASE_URL=location.protocol==="file:"?"http://localhost:8000":"";
+const api=(path,body,method)=>fetch(BASE_URL+path,{method:method||(body?"POST":"GET"),headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined}).then(async r=>{
+ const j=await r.json().catch(()=>({}));
+ if(!r.ok){const e=j.error||{},d=e.details;let x="";if(d&&Array.isArray(d.violations))x=": "+d.violations.join("; ");else if(d&&typeof d==="object")x=": "+Object.entries(d).filter(([k,v])=>typeof v==="string").map(([k,v])=>k+" "+v).join("; ");throw new Error((e.message||("Request failed ("+r.status+")"))+x)}
+ return j});
+let GOTO=()=>{},REPORT_EMP=null;
+let TODAY="2026-10-22",D,employees,EM,PN,tasks,TM,assigns,asgT,asgE,resources,projects,comms,meets,deps,constraints,consByTask,rank,score,RELOAD=()=>{};
+const by=(a,k)=>Object.fromEntries(a.map(x=>[x[k],x]));
+const pad=(n,l)=>String(n).padStart(l,"0");
+const sp=v=>String(v==null?"":v).split(",").map(x=>x.trim()).filter(Boolean);
+const sumBy=(a,f)=>a.reduce((s,x)=>s+f(x),0);
+const days=d=>Math.round((new Date(d)-new Date(TODAY))/864e5);
+const grp=(a,f)=>{const m={};a.forEach(x=>{const k=f(x);m[k]=(m[k]||0)+1});return Object.entries(m)};
+const PR={Critical:0,High:1,Medium:2,Low:3};
+const topic=t=>/deadline|sprint/i.test(t)?"Schedule":/compute|resource/i.test(t)?"Resources":/blocked|unavailable/i.test(t)?"Blocker":/scope|requirement/i.test(t)?"Requirements":/Python|employee/i.test(t)?"Staffing":/Deployment|ready for testing/i.test(t)?"Release":/meeting|review/i.test(t)?"Coordination":"General";
+function buildModel(D){
+const employees=D.Employees.map(e=>({id:e.Employee_ID,name:e.Employee_Name,dept:e.Department,role:e.Role,skills:sp(e.Skills),exp:+e.Experience_Years,hours:+e.Availability_Hours_Per_Day,avail:Math.round(e.Availability_Hours_Per_Day/9*100),workload:+e.Current_Workload_Percent,perf:+e.Performance_Score,team:e.Team_ID,mode:e.Work_Mode}));
+const EM=by(employees,"id");
+const PN=Object.fromEntries(D.Projects.map(p=>[p.Project_ID,p.Project_Name]));
+const tasks=D.Tasks.map(t=>({id:t.Task_ID,pid:t.Project_ID,project:PN[t.Project_ID]||t.Project_ID,name:t.Task_Name,skills:sp(t.Required_Skills),priority:t.Priority,hours:+t.Estimated_Hours,deadline:String(t.Deadline),dep:t.Dependency_Task_ID||"None",req:+t.Required_Employees,status:t.Status,dept:t.Department}));
+const TM=by(tasks,"id");
+const assigns=D.Assignments.map(a=>({id:a.Assignment_ID,emp:a.Employee_ID,task:a.Task_ID,match:+a.Skill_Match_Score,av:+a.Availability_Score,wf:+a.Workload_Factor,score:+a.Assignment_Score,status:a.Assignment_Status}));
+const asgT={},asgE={};assigns.forEach(a=>{(asgT[a.task]=asgT[a.task]||[]).push(a);(asgE[a.emp]=asgE[a.emp]||[]).push(a)});
+const resources=D.Resources.map(r=>({id:r.Resource_ID,name:r.Resource_Name,type:r.Resource_Type,cap:+r.Capacity,util:+r.Utilization_Percent,status:r.Availability_Status,pid:r.Project_ID,project:PN[r.Project_ID]||r.Project_ID}));
+const projects=D.Projects.map(p=>{const ts=tasks.filter(t=>t.pid===p.Project_ID),dn=ts.filter(t=>t.status==="Completed").length;return{id:p.Project_ID,name:p.Project_Name,dept:p.Primary_Department,priority:p.Priority,status:p.Status,team:+p.Team_Size,deadline:String(p.Target_Completion_Date),progress:ts.length?Math.round(dn/ts.length*100):0,tasks:ts.length}});
+const comms=D.Communications.map(m=>({id:m.Message_ID,from:(EM[m.Sender_ID]||{}).name||m.Sender_ID,to:(EM[m.Receiver_ID]||{}).name||m.Receiver_ID,pid:m.Project_ID,project:PN[m.Project_ID]||m.Project_ID,type:m.Communication_Type,text:m.Message_Text,ts:String(m.Timestamp),priority:m.Priority,action:m.Action_Required}));
+const meets=D.Meetings.map(m=>({id:m.Meeting_ID,pid:m.Project_ID,project:PN[m.Project_ID]||m.Project_ID,topic:m.Topic,people:sp(m.Participants),summary:m.Discussion_Summary,decisions:m.Decisions,items:m.Action_Items,date:String(m.Meeting_Date)}));
+const deps=D.Task_Dependencies.map(d=>({id:d.Dependency_ID,pre:d.Predecessor_Task_ID,suc:d.Successor_Task_ID,type:d.Dependency_Type}));
+/* CSP: a constraint is checked against the task's currently Assigned employees */
+const evalC=(c,emps,t)=>{const v=String(c.value),n=parseFloat(v.replace(/\D+/g," ").trim())||0;
+ switch(c.type){
+ case"Required Skill":return emps.every(e=>e.skills.includes(v));
+ case"Minimum Experience":return emps.every(e=>e.exp>=n);
+ case"Maximum Workload":return emps.every(e=>e.workload<=n);
+ case"Availability":return emps.every(e=>e.hours>=5);
+ case"Working Hours":return emps.every(e=>e.hours<=n);
+ case"Department Match":return emps.every(e=>e.dept===t.dept);
+ case"Deadline":return t.status==="Completed"||t.deadline>=TODAY;
+ case"Task Dependency":return t.dep==="None"||!TM[t.dep]||TM[t.dep].status==="Completed";
+ case"Team Capacity":return emps.every(e=>(asgE[e.id]||[]).filter(a=>a.status==="Assigned").length<=n);
+ case"Resource Availability":{const rs=resources.filter(r=>r.pid===t.pid);return !(rs.length&&rs.every(r=>r.status==="Unavailable"))}
+ default:return true}};
+const constraints=D.Constraints.map(c=>{const o={id:c.Constraint_ID,task:c.Task_ID,type:c.Constraint_Type,value:c.Constraint_Value,level:c.Constraint_Level},t=TM[o.task];
+ const em=(asgT[o.task]||[]).filter(a=>a.status==="Assigned").map(a=>EM[a.emp]).filter(Boolean);
+ o.status=!t||evalC(o,em,t)?"Satisfied":"Violated";return o});
+const consByTask={};constraints.forEach(c=>(consByTask[c.task]=consByTask[c.task]||[]).push(c));
+const passes=(t,e)=>(consByTask[t.id]||[]).filter(c=>c.level==="Hard").every(c=>evalC(c,[e],t));
+const score=(e,t)=>{const m=Math.round(100*t.skills.filter(k=>e.skills.includes(k)).length/Math.max(1,t.skills.length));const wl=Math.max(0,100-e.workload*2);return{match:m,score:Math.round(.4*m+.25*e.avail+.2*wl+.15*e.perf)}};
+const rank=t=>employees.map(e=>({e,...score(e,t),ok:passes(t,e)})).sort((a,b)=>(b.ok-a.ok)||(b.score-a.score)).slice(0,6);
+
+return {employees,EM,PN,tasks,TM,assigns,asgT,asgE,resources,projects,comms,meets,deps,constraints,consByTask,rank,score};
+}
+function load(raw){D=raw;TODAY=raw.today||TODAY;({employees,EM,PN,tasks,TM,assigns,asgT,asgE,resources,projects,comms,meets,deps,constraints,consByTask,rank,score}=buildModel(raw))}
+/* ---------- UI primitives ---------- */
+const Ic=({d,c="w-5 h-5"})=><svg className={c} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d={d}/></svg>;
+const Logo=()=><svg viewBox="0 0 32 32" className="w-8 h-8"><rect width="32" height="32" rx="9" fill="#4f46e5"/><g stroke="#fff" strokeWidth="1.8"><path d="M16 9 9 21M16 9l7 12M9 21h14"/></g><g fill="#fff"><circle cx="16" cy="9" r="3"/><circle cx="9" cy="21" r="3"/><circle cx="23" cy="21" r="3"/></g></svg>;
+const COL={Critical:"bg-rose-50 text-rose-700",High:"bg-orange-50 text-orange-700",Medium:"bg-amber-50 text-amber-700",Low:"bg-emerald-50 text-emerald-700",Pending:"bg-slate-100 text-slate-600","In Progress":"bg-indigo-50 text-indigo-700",Completed:"bg-emerald-50 text-emerald-700",Blocked:"bg-rose-50 text-rose-700","On track":"bg-emerald-50 text-emerald-700","At risk":"bg-amber-50 text-amber-700",Delayed:"bg-rose-50 text-rose-700",Active:"bg-emerald-50 text-emerald-700","On leave":"bg-slate-100 text-slate-600",Satisfied:"bg-emerald-50 text-emerald-700",Violated:"bg-rose-50 text-rose-700",Hard:"bg-indigo-50 text-indigo-700",Soft:"bg-slate-100 text-slate-600"};
+const Badge=({v})=><span className={"inline-block px-2 py-0.5 rounded-full text-xs font-semibold whitespace-nowrap "+(COL[v]||"bg-slate-100 text-slate-600")}>{v}</span>;
+const Load=({v})=>{const [t,c]=v<15?["Low","bg-emerald-50 text-emerald-700"]:v<28?["Medium","bg-amber-50 text-amber-700"]:["High","bg-rose-50 text-rose-700"];return <span className={"inline-block px-2 py-0.5 rounded-full text-xs font-semibold "+c}>{t} · {v}%</span>};
+const Bar=({v,c="bg-indigo-500"})=><div className="h-2 rounded-full bg-slate-100 w-full"><div className={"h-2 rounded-full "+c} style={{width:v+"%"}}/></div>;
+const Page=({title,sub,children,right})=><div><div className="flex flex-wrap items-end justify-between gap-3 mb-5"><div><h1 className="text-2xl font-extrabold tracking-tight">{title}</h1><p className="text-slate-500 text-sm mt-1">{sub}</p></div>{right}</div>{children}</div>;
+const Kpi=({l,v,n,tone})=><div className="card p-4"><div className="text-sm text-slate-500 font-medium">{l}</div><div className="text-3xl font-extrabold mt-1">{v}</div><div className={"text-xs mt-1 font-semibold "+(tone||"text-emerald-600")}>{n}</div></div>;
+const inp="border border-slate-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300";
+function Table({cols,rows,onRow,size=10}){
+ const [q,setQ]=useState(""),[sk,setSk]=useState(null),[asc,setAsc]=useState(true),[pg,setPg]=useState(0);
+ const [fl,setFl]=useState({});
+ const filt=useMemo(()=>{let x=rows.filter(o=>cols.every(c=>!fl[c.k]||String(c.f?c.f(o):o[c.k])===fl[c.k]));if(q)x=x.filter(o=>JSON.stringify(o).toLowerCase().includes(q.toLowerCase()));if(sk)x=[...x].sort((a,b)=>(a[sk]>b[sk]?1:-1)*(asc?1:-1));return x},[rows,q,sk,asc,fl]);
+ useEffect(()=>setPg(0),[q,fl]);
+ const pages=Math.max(1,Math.ceil(filt.length/size)),view=filt.slice(pg*size,pg*size+size);
+ return <div className="card overflow-hidden"><div className="p-3 flex flex-wrap gap-2 border-b border-slate-100">
+  <input className={inp+" w-full sm:w-64"} placeholder="Search…" value={q} onChange={e=>setQ(e.target.value)}/>
+  {cols.filter(c=>c.filter).map(c=><select key={c.k} className={inp} value={fl[c.k]||""} onChange={e=>setFl({...fl,[c.k]:e.target.value})}><option value="">{c.h}: all</option>{[...new Set(rows.map(o=>c.f?c.f(o):o[c.k]))].sort().map(v=><option key={v}>{v}</option>)}</select>)}</div>
+  <div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr className="text-left text-slate-500 bg-slate-50">{cols.map(c=><th key={c.k} className="th px-3 py-2.5 font-semibold whitespace-nowrap" onClick={()=>{setSk(c.k);setAsc(sk===c.k?!asc:true)}}>{c.h}{sk===c.k?(asc?" ↑":" ↓"):""}</th>)}</tr></thead>
+  <tbody>{view.map(o=><tr key={o.id} onClick={()=>onRow&&onRow(o)} className="border-t border-slate-100 hover:bg-indigo-50/40 cursor-pointer">{cols.map(c=><td key={c.k} className="px-3 py-2.5 whitespace-nowrap">{c.r?c.r(o):o[c.k]}</td>)}</tr>)}</tbody></table>
+  {!view.length&&<div className="p-10 text-center text-slate-500 text-sm">No records match these filters. Clear a filter to see results.</div>}</div>
+  <div className="p-3 flex items-center justify-between text-sm text-slate-500 border-t border-slate-100"><span>{filt.length} records</span><div className="flex items-center gap-2"><button disabled={pg===0} onClick={()=>setPg(pg-1)} className="px-2 py-1 rounded border disabled:opacity-40">Prev</button><span>{pg+1} / {pages}</span><button disabled={pg>=pages-1} onClick={()=>setPg(pg+1)} className="px-2 py-1 rounded border disabled:opacity-40">Next</button></div></div></div>}
+const Panel=({title,onClose,children})=><div className="fixed inset-0 z-40 flex justify-end" role="dialog"><div className="absolute inset-0 bg-slate-900/30" onClick={onClose}/><div className="panel relative w-full max-w-md bg-white h-full overflow-y-auto p-5 shadow-2xl"><div className="flex justify-between items-start mb-4"><h2 className="text-lg font-extrabold">{title}</h2><button onClick={onClose} aria-label="Close" className="text-slate-400 hover:text-slate-700 text-xl leading-none">×</button></div>{children}</div></div>;
+const Row=({l,children})=><div className="flex justify-between gap-3 py-2 border-b border-slate-100 text-sm"><span className="text-slate-500">{l}</span><span className="font-semibold text-right">{children}</span></div>;
+const Ring=({v,size=120})=>{const R=size/2-10,C=2*Math.PI*R;return <svg width={size} height={size}><circle cx={size/2} cy={size/2} r={R} stroke="#e8ebf5" strokeWidth="10" fill="none"/><circle cx={size/2} cy={size/2} r={R} stroke="#4f46e5" strokeWidth="10" fill="none" strokeLinecap="round" strokeDasharray={C} strokeDashoffset={C*(1-v/100)} transform={`rotate(-90 ${size/2} ${size/2})`}/><text x="50%" y="52%" textAnchor="middle" dominantBaseline="middle" fontSize={size/3.2} fontWeight="800" fill="#14213d">{v}</text></svg>};
+/* ---------- Pages ---------- */
+const Dist=({title,data,unit=""})=>{const mx=Math.max(1,...data.map(d=>d[1]));return <div className="card p-5"><h3 className="font-bold mb-3">{title}</h3><div className="space-y-2.5">{data.map(([l,v,c])=><div key={l}><div className="flex justify-between text-xs mb-1"><span className="text-slate-600">{l}</span><b>{v}{unit}</b></div><div className="h-2 rounded-full bg-slate-100"><div className="h-2 rounded-full" style={{width:v/mx*100+"%",background:c||"#4f46e5"}}/></div></div>)}</div></div>};
+const Chips=({a})=><div className="flex flex-wrap gap-2">{a.map(k=><span key={k} className="px-2 py-1 rounded-md bg-indigo-50 text-indigo-700 text-xs font-semibold">{k}</span>)}</div>;
+const H4=({children})=><h4 className="font-bold mt-5 mb-2 text-sm">{children}</h4>;
+const Mini=({rows})=>rows.length?rows.map(r=><div key={r[0]} className="flex justify-between gap-3 text-sm py-2 border-b border-slate-100"><span>{r[1]}</span>{r[2]}</div>):<div className="text-sm text-slate-500 py-2">None on record.</div>;
+function Dashboard(){
+ const cnt=k=>tasks.filter(t=>t.status===k).length,pend=cnt("Pending"),prog=cnt("In Progress"),done=cnt("Completed"),blk=cnt("Blocked");
+ const avg=Math.round(sumBy(employees,e=>e.workload)/employees.length);
+ const live=assigns.filter(a=>a.status!=="Rejected"),opt=Math.round(sumBy(live,a=>a.score)/live.length);
+ const open=tasks.filter(t=>t.status!=="Completed"),soon=open.filter(t=>days(t.deadline)>=0&&days(t.deadline)<=14).length;
+ const under=employees.filter(e=>e.workload<15).length;
+ const bad=new Set(constraints.filter(c=>c.status==="Violated"&&c.level==="Hard").map(c=>c.task));
+ const hiRisk=open.filter(t=>(t.priority==="Critical"||t.priority==="High")&&bad.has(t.id)).length;
+ const better=assigns.filter(a=>a.status==="Suggested"&&a.score>=85).length;
+ const segs=[["Pending",pend,"#94a3b8"],["In Progress",prog,"#4f46e5"],["Completed",done,"#10b981"],["Blocked",blk,"#f43f5e"]];
+ const bins=Array.from({length:8},(_,i)=>employees.filter(e=>e.workload>=5+i*5&&e.workload<10+i*5+(i===7?1:0)).length),mx=Math.max(1,...bins);
+ const ins=[soon+" open tasks are due within 14 days.",under+" employees are below 15% workload.",hiRisk+" high-priority tasks have unresolved hard-constraint violations.",better+" suggested assignments score 85 or higher and are ready to apply."];
+ const top=projects.filter(p=>p.status==="Active").sort((a,b)=>PR[a.priority]-PR[b.priority]||a.deadline.localeCompare(b.deadline)).slice(0,5);
+ return <Page title="Good morning, Manvi" sub="Here's your organization's collaboration overview.">
+ <div className="card p-4 mb-4 flex flex-wrap items-center gap-2 text-sm bg-gradient-to-r from-indigo-50 to-white">{["Tasks","Candidate employees","Heuristic scoring","Constraint validation","Optimal assignment"].map((x,i)=><React.Fragment key={x}>{i>0&&<span className="text-indigo-400">›</span>}<span className="font-semibold text-indigo-900">{x}</span></React.Fragment>)}<span className="text-slate-500 ml-auto hidden md:inline">Heuristic search + CSP recommend better assignments.</span></div>
+ <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-4"><Kpi l="Total Employees" v={employees.length} n={D.Departments.length+" departments"} tone="text-slate-500"/><Kpi l="Active Projects" v={projects.filter(p=>p.status==="Active").length} n={"of "+projects.length+" projects"} tone="text-slate-500"/><Kpi l="Pending Tasks" v={pend} n={"of "+tasks.length+" total"} tone="text-amber-600"/><Kpi l="Available Resources" v={resources.filter(r=>r.status==="Available").length} n={"of "+resources.length+" resources"} tone="text-slate-500"/>
+ <Kpi l="Tasks Completed" v={done} n={Math.round(done/tasks.length*100)+"% of all tasks"}/><Kpi l="High Priority Tasks" v={open.filter(t=>t.priority==="Critical"||t.priority==="High").length} n="Open and not completed" tone="text-rose-600"/><Kpi l="Avg Employee Workload" v={avg+"%"} n={"Across "+employees.length+" employees"} tone="text-slate-500"/><Kpi l="Optimization Score" v={opt} n="Mean score of live assignments"/></div>
+ <div className="grid lg:grid-cols-3 gap-4 mb-4">
+ <div className="card p-5 lg:col-span-2"><h3 className="font-bold mb-4">Task Optimization Overview</h3><div className="flex flex-wrap items-center gap-8"><svg width="170" height="170" viewBox="0 0 170 170">{(()=>{let o=0;const R=65,C=2*Math.PI*R;return segs.map(([n,v,c])=>{const l=v/tasks.length*C,el=<circle key={n} cx="85" cy="85" r={R} fill="none" stroke={c} strokeWidth="22" strokeDasharray={l+" "+(C-l)} strokeDashoffset={-o} transform="rotate(-90 85 85)"/>;o+=l;return el})})()}<text x="85" y="82" textAnchor="middle" fontSize="26" fontWeight="800" fill="#14213d">{tasks.length}</text><text x="85" y="102" textAnchor="middle" fontSize="11" fill="#64748b">tasks</text></svg>
+ <div className="flex-1 min-w-[200px] space-y-3">{segs.map(([n,v,c])=><div key={n}><div className="flex justify-between text-sm mb-1"><span className="flex items-center gap-2"><i className="w-2.5 h-2.5 rounded-full" style={{background:c}}/>{n}</span><b>{v}</b></div><div className="h-2 rounded-full bg-slate-100"><div className="h-2 rounded-full" style={{width:v/tasks.length*100+"%",background:c}}/></div></div>)}</div></div></div>
+ <div className="card p-5"><h3 className="font-bold mb-3">AI Insights</h3><ul className="space-y-3">{ins.map(x=><li key={x} className="flex gap-2 text-sm"><span className="mt-1.5 w-2 h-2 rounded-full bg-indigo-500 shrink-0"/>{x}</li>)}</ul></div></div>
+ <div className="grid lg:grid-cols-3 gap-4"><div className="card p-5"><h3 className="font-bold mb-1">Employee Workload</h3><p className="text-xs text-slate-500 mb-3">Employees per workload band (%)</p><svg viewBox="0 0 240 130" className="w-full">{bins.map((b,i)=><g key={i}><rect x={i*30+4} y={105-b/mx*95} width="22" height={b/mx*95} rx="4" fill={i<2?"#10b981":i<5?"#f59e0b":"#f43f5e"}/><text x={i*30+15} y="120" fontSize="9" textAnchor="middle" fill="#64748b">{5+i*5}</text><text x={i*30+15} y={101-b/mx*95} fontSize="9" textAnchor="middle" fill="#14213d">{b}</text></g>)}</svg></div>
+ <div className="card p-5 lg:col-span-2 overflow-x-auto"><h3 className="font-bold mb-3">Project Progress</h3><table className="w-full text-sm"><tbody>{top.map(p=><tr key={p.id} className="border-t border-slate-100"><td className="py-2.5 pr-3 font-semibold whitespace-nowrap">{p.name}</td><td className="w-32 pr-3"><Bar v={p.progress}/></td><td className="pr-3">{p.progress}%</td><td className="pr-3"><Badge v={p.priority}/></td><td className="pr-3 text-slate-500 whitespace-nowrap">{p.deadline}</td><td><Badge v={p.status}/></td></tr>)}</tbody></table></div></div></Page>}
+function Employees(){
+ const [sel,setSel]=useState(null);
+ const cols=[{k:"id",h:"ID"},{k:"name",h:"Employee",r:o=><b>{o.name}</b>},{k:"dept",h:"Department",filter:1},{k:"role",h:"Role",filter:1},{k:"skills",h:"Skills",r:o=>o.skills.join(", ")},{k:"exp",h:"Experience",r:o=>o.exp+" yrs"},{k:"hours",h:"Availability",r:o=>o.hours+" h/day"},{k:"workload",h:"Workload",r:o=><Load v={o.workload}/>},{k:"perf",h:"Performance"},{k:"team",h:"Team",filter:1},{k:"mode",h:"Work mode",filter:1,r:o=><Badge v={o.mode}/>}];
+ const mine=sel?(asgE[sel.id]||[]).filter(a=>a.status==="Assigned").map(a=>TM[a.task]).filter(Boolean):[];
+ const rec=sel?tasks.filter(t=>t.status==="Pending").map(t=>({t,m:t.skills.filter(k=>sel.skills.includes(k)).length+(t.dept===sel.dept?.5:0)})).filter(x=>x.m>0).sort((a,b)=>b.m-a.m).slice(0,3).map(x=>x.t):[];
+ return <Page title="Employees" sub="Manage workforce skills, availability and workload."><Table cols={cols} rows={employees} onRow={setSel}/>
+ {sel&&<Panel title={sel.name} onClose={()=>setSel(null)}><Row l="Employee ID">{sel.id}</Row><Row l="Department">{sel.dept}</Row><Row l="Role">{sel.role}</Row><Row l="Team">{sel.team} · {sel.mode}</Row><Row l="Experience">{sel.exp} years</Row><Row l="Performance score">{sel.perf}/100</Row><Row l="Availability">{sel.hours} hours/day</Row>
+ <H4>Skills</H4><Chips a={sel.skills}/><H4>Workload</H4><div className="text-xs text-slate-500 mb-1">{sel.workload}% of capacity</div><Bar v={sel.workload*2.5} c={sel.workload<15?"bg-emerald-500":sel.workload<28?"bg-amber-500":"bg-rose-500"}/>
+ <H4>Current projects</H4><Chips a={[...new Set(mine.map(t=>t.project))].slice(0,8)}/><H4>Assigned tasks ({mine.length})</H4><Mini rows={mine.slice(0,6).map(t=>[t.id,t.id+" · "+t.name,<Badge v={t.status}/>])}/>
+ <H4>Recommended tasks</H4><Mini rows={rec.map(t=>[t.id,t.id+" · "+t.name,<Badge v={t.priority}/>])}/>
+ <button onClick={()=>{REPORT_EMP=sel.id;GOTO("Employee Report")}} className="mt-5 w-full px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700">Generate full report</button></Panel>}</Page>}
+const StatusEdit=({t})=>{const [v,setV]=useState(t.status),[m,setM]=useState("");return <div className="py-2 border-b border-slate-100 text-sm flex justify-between items-center gap-3"><span className="text-slate-500">Status</span><span className="text-right"><select className={inp+" py-1"} value={v} onChange={e=>{const s=e.target.value;setV(s);setM("Saving…");api("/api/tasks/"+t.id,{Status:s},"PUT").then(()=>{setM("Saved");RELOAD()}).catch(x=>{setM(x.message);setV(t.status)})}}>{["Pending","In Progress","Completed","Blocked"].map(s=><option key={s}>{s}</option>)}</select><span className="block text-xs text-slate-500">{m}</span></span></div>};
+function Tasks(){
+ const [sel,setSel]=useState(null);
+ const cols=[{k:"id",h:"Task ID"},{k:"name",h:"Task",r:o=><b>{o.name}</b>,filter:1},{k:"project",h:"Project"},{k:"skills",h:"Required skills",r:o=>o.skills.join(", ")},{k:"priority",h:"Priority",filter:1,r:o=><Badge v={o.priority}/>},{k:"hours",h:"Est. hours"},{k:"deadline",h:"Deadline"},{k:"dep",h:"Dependency"},{k:"req",h:"Employees"},{k:"status",h:"Status",filter:1,r:o=><Badge v={o.status}/>},{k:"dept",h:"Department",filter:1}];
+ const cur=sel?(asgT[sel.id]||[]):[],cs=sel?consByTask[sel.id]||[]:[],best=sel?rank(sel):[];
+ return <Page title="Tasks" sub="Track every task, its skills, deadline and dependencies."><Table cols={cols} rows={tasks} onRow={setSel}/>
+ {sel&&<Panel title={sel.id+" · "+sel.name} onClose={()=>setSel(null)}><Row l="Project">{sel.project}</Row><Row l="Department">{sel.dept}</Row><Row l="Priority"><Badge v={sel.priority}/></Row><StatusEdit key={sel.id} t={sel}/><Row l="Deadline">{sel.deadline}</Row><Row l="Estimated hours">{sel.hours}</Row><Row l="Employees needed">{sel.req}</Row>
+ <H4>Required skills</H4><Chips a={sel.skills}/>
+ <H4>Dependencies</H4><Mini rows={[...deps.filter(d=>d.suc===sel.id).map(d=>[d.id,"Needs "+d.pre,<span className="text-slate-500">{d.type}</span>]),...deps.filter(d=>d.pre===sel.id).map(d=>[d.id,"Blocks "+d.suc,<span className="text-slate-500">{d.type}</span>])]}/>
+ <H4>Current assignment</H4><Mini rows={cur.map(a=>[a.id,(EM[a.emp]||{}).name||a.emp,<Badge v={a.status==="Assigned"?"In Progress":a.status==="Completed"?"Completed":a.status==="Rejected"?"Blocked":"Pending"}/>])}/>
+ <H4>Resources for {sel.project}</H4><Mini rows={resources.filter(r=>r.pid===sel.pid).slice(0,4).map(r=>[r.id,r.name,<span className="text-slate-500">{r.status}</span>])}/>
+ <H4>Constraints</H4><Mini rows={cs.map(c=>[c.id,c.type+": "+c.value,<Badge v={c.status}/>])}/>
+ <H4>Suitable employees</H4><Mini rows={best.slice(0,3).map(x=>[x.e.id,x.e.name,<b>{x.score}</b>])}/>
+ <div className="mt-4 p-3 rounded-lg bg-indigo-50 text-sm text-indigo-900">Recommendation: {best[0].ok?"assign "+best[0].e.name+" (score "+best[0].score+"); passes all hard constraints.":"no top candidate passes every hard constraint; review constraints first."}</div></Panel>}</Page>}
+const STEPS=["Input","Candidate Generation","Heuristic Evaluation","Constraint Checking","Best Assignment"];
+function Optimize(){
+ const open=useMemo(()=>tasks.filter(t=>t.status!=="Completed"),[]);
+ const [tid,setTid]=useState(open[0].id),[step,setStep]=useState(-1),[msg,setMsg]=useState(null),[cmp,setCmp]=useState(false),[srv,setSrv]=useState(null),[err,setErr]=useState(null),[busy,setBusy]=useState(false),[applied,setApplied]=useState(false),[sel,setSel]=useState([]);
+ const t=TM[tid]||open[0];
+ const fetchRank=()=>{setErr(null);setBusy(true);return api("/api/optimize",{task_id:tid}).then(r=>{setSrv(r);setSel(r.options.length?[r.options[0].employee_id]:[])}).catch(e=>{setSrv(null);setErr(e.message)}).finally(()=>setBusy(false))};
+ useEffect(()=>{setStep(-1);setMsg(null);setApplied(false);setSrv(null);fetchRank()},[tid]);
+ useEffect(()=>{if(step<0||step>=4)return;const h=setTimeout(()=>setStep(step+1),650);return()=>clearTimeout(h)},[step]);
+ const list=(srv?srv.options:[]).map(c=>({e:EM[c.employee_id]||{id:c.employee_id,name:c.name,hours:c.availability_hours,workload:c.workload,perf:c.performance,avail:c.availability_score},match:c.skill_match,score:c.score,ok:c.passes_hard_constraints,viol:c.violations,rec:c.recommended,av:c.available,open:c.open_tasks}));
+ const chosen=list.filter(x=>sel.includes(x.e.id)),done=step>=4&&list.length>0,best=chosen[0]||list[0];
+ const apply=()=>{setMsg(null);api("/api/assignments/apply",{task_id:t.id,employee_ids:sel}).then(r=>{const n=r.assignments.map(a=>(EM[a.Employee_ID]||{}).name||a.Employee_ID);setMsg({ok:true,t:"Assigned "+n.join(", ")+" to "+t.id+" ("+r.assignments.length+" saved)."+(r.still_needed?" "+r.still_needed+" more still needed.":"")});RELOAD();fetchRank()}).catch(e=>setMsg({ok:false,t:e.message}))};
+ return <Page title="AI Task Optimization" sub="Find the best employee-resource allocation using heuristic search.">
+ <div className="card p-4 mb-4 flex flex-wrap gap-2 items-center"><label className="text-sm font-semibold">Select task</label><select className={inp+" min-w-[260px] max-w-full"} value={tid} onChange={e=>setTid(e.target.value)}>{open.map(x=><option key={x.id} value={x.id}>{x.id} · {x.name} · {x.project}</option>)}</select>
+ <div className="ml-auto flex gap-2 flex-wrap"><button onClick={()=>{setMsg(null);setApplied(false);setStep(0);fetchRank()}} className="px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700">Run Optimization</button><button disabled={!done||!sel.length} onClick={apply} className="px-4 py-2 rounded-lg border border-indigo-200 text-indigo-700 text-sm font-semibold disabled:opacity-40">Apply Assignment</button><button onClick={()=>setCmp(!cmp)} className="px-4 py-2 rounded-lg border text-sm font-semibold">Compare Candidates</button></div></div>
+ <div className="card p-4 mb-4 overflow-x-auto"><div className="flex items-center gap-2 min-w-[640px]">{STEPS.map((x,i)=><React.Fragment key={x}>{i>0&&<div className={"h-0.5 flex-1 "+(step>=i?"bg-indigo-500":"bg-slate-200")}/>}<div className={"px-3 py-2 rounded-lg text-xs font-bold text-center "+(step>=i?"bg-indigo-600 text-white":"bg-slate-100 text-slate-500")}>{x}</div></React.Fragment>)}</div>
+ <p className="text-xs text-slate-500 mt-3">{srv?srv.strategy+". Evaluated "+srv.evaluated+" employees. "+srv.free+" employees are free right now (at least 5 h/day and no open task). Pick one of the top "+list.length+" below; each person takes one task at a time. This task needs "+srv.required+" employee(s): "+srv.assigned.length+" assigned, "+srv.remaining+" open.":"Heuristic search scores every employee, then CSP checks the task's hard constraints on the ECOS server."}</p></div>
+ <div className="grid lg:grid-cols-3 gap-4"><div className="card p-5"><h3 className="font-bold mb-2">Task requirements</h3><Row l="Required skills">{t.skills.join(", ")}</Row><Row l="Priority"><Badge v={t.priority}/></Row><Row l="Estimated hours">{t.hours}</Row><Row l="Deadline">{t.deadline}</Row><Row l="Department">{t.dept}</Row><Row l="Dependencies">{t.dep}</Row><Row l="Employees needed">{t.req}</Row>
+ <div className="flex flex-col items-center mt-5"><Ring v={done?Math.round(chosen.length?chosen.reduce((a,x)=>a+x.score,0)/chosen.length:best.score):0}/><div className="text-sm text-slate-500 mt-1">{done?"Optimization score":"Run optimization to score"}</div></div></div>
+ <div className="card overflow-x-auto lg:col-span-2"><div className="p-4 font-bold">Recommended employees</div>
+ {err&&<div className="m-4 p-3 rounded-lg bg-rose-50 text-rose-800 text-sm">Could not load candidates: {err}. <button className="underline font-semibold" onClick={fetchRank}>Retry</button></div>}
+ {busy&&!srv&&<div className="p-6 text-sm text-slate-500">Finding free employees…</div>}
+ {srv&&!list.length&&<div className="m-4 p-3 rounded-lg bg-amber-50 text-amber-800 text-sm">{srv.remaining?"No free employee passes this task's hard constraints right now. An employee is free with at least 5 h/day and no other open task.":"This task already has all the employees it needs."}</div>}
+ {list.length>0&&<table className="w-full text-sm"><thead><tr className="text-left text-slate-500 bg-slate-50">{["Choose","Option","Employee","Skill match","Availability","Open tasks","Workload","Perf.","Constraints","Score"].map(h=><th key={h} className="px-3 py-2 whitespace-nowrap">{h}</th>)}</tr></thead>
+ <tbody>{list.map((x,i)=><tr key={x.e.id} className={"border-t border-slate-100 "+(sel.includes(x.e.id)?"bg-indigo-50":"")}><td className="px-3"><input type="radio" name="pick" aria-label={"Choose "+x.e.name} checked={sel.includes(x.e.id)} onChange={()=>setSel([x.e.id])}/></td><td className="px-3 py-2.5 font-bold">{i+1}</td><td className="px-3 whitespace-nowrap"><b>{x.e.name}</b>{i===0&&<span className="ml-2 text-xs text-indigo-700 font-bold">Best match</span>}</td><td className="px-3">{x.match}%</td><td className="px-3">{x.e.hours} h/day{!x.av&&<span className="text-amber-700"> · limited</span>}</td><td className="px-3">{x.open}</td><td className="px-3"><Load v={x.e.workload}/></td><td className="px-3">{x.e.perf}</td><td className="px-3" title={x.viol.join("; ")}>{x.ok?<span className="text-emerald-700 font-semibold">Pass</span>:<span className="text-amber-700 font-semibold">Fails hard rule</span>}</td><td className="px-3 font-extrabold">{x.score}</td></tr>)}</tbody></table>}
+ {msg&&<div className={"m-4 p-3 rounded-lg text-sm font-semibold "+(msg.ok?"bg-emerald-50 text-emerald-800":"bg-rose-50 text-rose-800")}>{msg.t}</div>}
+ {cmp&&list.length>0&&<div className="m-4 grid sm:grid-cols-3 gap-3">{list.slice(0,3).map(x=><div key={x.e.id} className="border rounded-lg p-3 text-sm"><b>{x.e.name}</b>{[["Skills",x.match],["Availability",x.e.avail],["Performance",x.e.perf]].map(([l,v])=><div key={l} className="mt-2"><div className="text-xs text-slate-500">{l} {v}%</div><Bar v={v}/></div>)}</div>)}</div>}</div></div></Page>}
+function CSP(){
+ const v=constraints.filter(c=>c.status==="Violated").length,h=constraints.filter(c=>c.level==="Hard").length;
+ const cols=[{k:"id",h:"Constraint ID"},{k:"task",h:"Task ID"},{k:"type",h:"Type",filter:1},{k:"value",h:"Value"},{k:"level",h:"Level",filter:1,r:o=><Badge v={o.level}/>},{k:"status",h:"Status",filter:1,r:o=><Badge v={o.status}/>}];
+ const types=[...new Set(constraints.map(c=>c.type))].sort();
+ return <Page title="Constraint Management" sub="Ensure every task assignment satisfies organizational rules.">
+ <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-4"><Kpi l="Total Constraints" v={constraints.length} n="From workbook" tone="text-slate-500"/><Kpi l="Hard" v={h} n="Must hold" tone="text-slate-500"/><Kpi l="Soft" v={constraints.length-h} n="Preferred" tone="text-slate-500"/><Kpi l="Violations" v={v} n="Review needed" tone="text-rose-600"/><Kpi l="Satisfied" v={constraints.length-v} n={Math.round((constraints.length-v)/constraints.length*100)+"% of all"}/></div>
+ <div className="grid lg:grid-cols-3 gap-4"><div className="lg:col-span-2"><Table cols={cols} rows={constraints}/></div>
+ <div className="card p-5 h-fit"><h3 className="font-bold mb-1">Constraint validation</h3><p className="text-xs text-slate-500 mb-3">Each rule is checked against the task's assigned employees.</p>{types.map(t=>{const a=constraints.filter(c=>c.type===t),bad=a.filter(c=>c.status==="Violated").length;return <div key={t} className={"flex items-center gap-3 py-2 border-b border-slate-100 text-sm font-semibold "+(bad?"text-amber-700":"text-emerald-700")}><span className={"w-6 h-6 rounded-full flex items-center justify-center text-xs shrink-0 "+(bad?"bg-amber-100":"bg-emerald-100")}>{bad?"!":"✓"}</span><span className="flex-1">{t}</span><span className="text-xs text-slate-500">{bad?bad+" of "+a.length+" violated":"all "+a.length+" satisfied"}</span></div>})}</div></div></Page>}
+function Projects(){
+ const [sel,setSel]=useState(null);
+ const cols=[{k:"id",h:"Project ID"},{k:"name",h:"Project",r:o=><b>{o.name}</b>},{k:"dept",h:"Department",filter:1},{k:"priority",h:"Priority",filter:1,r:o=><Badge v={o.priority}/>},{k:"progress",h:"Progress",r:o=><div className="flex items-center gap-2 w-28"><Bar v={o.progress}/><span className="text-xs">{o.progress}%</span></div>},{k:"team",h:"Team size"},{k:"deadline",h:"Deadline"},{k:"status",h:"Status",filter:1,r:o=><Badge v={o.status}/>}];
+ const ts=sel?tasks.filter(t=>t.pid===sel.id):[],ids=new Set(ts.map(t=>t.id));
+ return <Page title="Projects" sub="Monitor progress, teams and deadlines across projects."><Table cols={cols} rows={projects} onRow={setSel}/>
+ {sel&&<Panel title={sel.id+" · "+sel.name} onClose={()=>setSel(null)}><Row l="Department">{sel.dept}</Row><Row l="Priority"><Badge v={sel.priority}/></Row><Row l="Status"><Badge v={sel.status}/></Row><Row l="Deadline">{sel.deadline}</Row><Row l="Team size">{sel.team}</Row><Row l="Progress">{sel.progress}% ({ts.filter(t=>t.status==="Completed").length} of {ts.length} tasks)</Row>
+ <H4>Tasks</H4><Mini rows={ts.slice(0,6).map(t=>[t.id,t.id+" · "+t.name,<Badge v={t.status}/>])}/>
+ <H4>Dependencies</H4><Mini rows={deps.filter(d=>ids.has(d.pre)||ids.has(d.suc)).slice(0,4).map(d=>[d.id,d.pre+" → "+d.suc,<span className="text-slate-500">{d.type}</span>])}/>
+ <H4>Resources</H4><Mini rows={resources.filter(r=>r.pid===sel.id).map(r=>[r.id,r.name,<span className="text-slate-500">{r.util}% used</span>])}/>
+ <H4>Communication</H4><p className="text-sm">{comms.filter(m=>m.pid===sel.id).length} messages and {meets.filter(m=>m.pid===sel.id).length} meetings on record.</p>
+ <div className="mt-4 p-3 rounded-lg bg-indigo-50 text-sm text-indigo-900">Insight: {ts.filter(t=>t.status==="Blocked").length} blocked and {ts.filter(t=>t.status==="Pending").length} pending tasks remain; {ts.filter(t=>t.status!=="Completed"&&t.deadline<TODAY).length} are past their deadline.</div></Panel>}</Page>}
+function Comms(){
+ const [tab,setTab]=useState("All"),[sel,setSel]=useState(null);
+ const T={All:null,Emails:"Email",Chats:"Chat","Project Updates":"Project Update",Documents:"Document Comment"};
+ const rows=useMemo(()=>T[tab]?comms.filter(m=>m.type===T[tab]):comms,[tab]);
+ const act=comms.filter(m=>m.action==="Yes").length,risk=comms.filter(m=>/deadline|blocked/i.test(m.text)).length,mgr=comms.filter(m=>m.action==="Yes"&&m.priority==="High").length;
+ const cols=[{k:"from",h:"Sender"},{k:"to",h:"Receiver"},{k:"project",h:"Project",filter:1},{k:"type",h:"Type"},{k:"text",h:"Message",r:o=><span className="block max-w-[260px] truncate">{o.text}</span>},{k:"ts",h:"Timestamp"},{k:"priority",h:"Priority",filter:1,r:o=><Badge v={o.priority}/>},{k:"action",h:"Action required",filter:1}];
+ return <Page title="Communications" sub="Review project messages and the actions they require.">
+ <div className="card p-4 mb-4 bg-gradient-to-r from-indigo-50 to-white"><h3 className="font-bold mb-2">AI Communication Summary</h3><ul className="text-sm space-y-1"><li>{act} messages require action.</li><li>{risk} messages mention deadline or blocker risks.</li><li>{mgr} high-priority conversations need manager attention.</li></ul></div>
+ <div className="flex gap-1 mb-3 overflow-x-auto">{Object.keys(T).map(k=><button key={k} onClick={()=>setTab(k)} className={"px-3 py-1.5 rounded-lg text-sm font-semibold whitespace-nowrap "+(tab===k?"bg-indigo-600 text-white":"bg-white border text-slate-600")}>{k}</button>)}</div>
+ <Table key={tab} cols={cols} rows={rows} onRow={setSel}/>
+ {sel&&<Panel title={sel.id+" · "+sel.type} onClose={()=>setSel(null)}><Row l="From">{sel.from}</Row><Row l="To">{sel.to}</Row><Row l="Project">{sel.project}</Row><Row l="Sent">{sel.ts}</Row><H4>Original message</H4><p className="text-sm p-3 rounded-lg bg-slate-50">{sel.text}</p>
+ <H4>AI summary</H4><p className="text-sm">{sel.from} to {sel.to} about {sel.project}: {topic(sel.text).toLowerCase()} item. Rule-based summary, no model call.</p><Row l="Detected topic">{topic(sel.text)}</Row><Row l="Priority"><Badge v={sel.priority}/></Row><Row l="Action required">{sel.action}</Row></Panel>}</Page>}
+function Meetings(){
+ const [sel,setSel]=useState(null),[gen,setGen]=useState(false);
+ useEffect(()=>setGen(false),[sel]);
+ const cols=[{k:"id",h:"Meeting ID"},{k:"project",h:"Project"},{k:"topic",h:"Topic",filter:1},{k:"people",h:"Participants",r:o=>o.people.length},{k:"date",h:"Date"},{k:"decisions",h:"Decisions",r:o=><span className="block max-w-[240px] truncate">{o.decisions}</span>},{k:"items",h:"Action items",r:o=><span className="block max-w-[240px] truncate">{o.items}</span>}];
+ const ai=sel?tasks.filter(t=>t.pid===sel.pid&&t.status!=="Completed").slice(0,3):[];
+ return <Page title="Meetings" sub="Track meeting decisions and follow-up actions.">
+ <Table cols={cols} rows={meets} onRow={setSel}/>
+ {sel&&<Panel title={sel.id+" · "+sel.topic} onClose={()=>setSel(null)}><Row l="Project">{sel.project}</Row><Row l="Date">{sel.date}</Row><H4>Participants</H4><Chips a={sel.people.map(p=>(EM[p]||{}).name||p)}/>
+ <H4>Discussion summary</H4><p className="text-sm">{sel.summary}</p><H4>Decisions</H4><p className="text-sm">{sel.decisions}</p><H4>Action items</H4><p className="text-sm mb-2">{sel.items}</p>
+ <Mini rows={ai.map(t=>{const a=(asgT[t.id]||[]).find(x=>x.status==="Assigned");return[t.id,t.id+" · "+t.name+" — "+((a&&EM[a.emp])?EM[a.emp].name:(EM[sel.people[0]]||{}).name||"Unassigned")+", due "+t.deadline,<Badge v={t.status}/>]})}/>
+ <button onClick={()=>{setGen("Generating…");api("/api/meetings/"+sel.id+"/summary",{}).then(r=>setGen(r.summary)).catch(e=>setGen("Could not generate summary: "+e.message))}} className="mt-4 px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold">Generate AI Summary</button>
+ {gen&&<div className="mt-3 p-3 rounded-lg bg-indigo-50 text-sm text-indigo-900">{gen}</div>}</Panel>}</Page>}
+function Resources(){
+ const types=[...new Set(resources.map(r=>r.type))].sort(),hot=resources.filter(r=>r.util>=90),top=[...resources].sort((a,b)=>b.util-a.util)[0];
+ const SC={Available:"bg-emerald-50 text-emerald-700","Partially Available":"bg-amber-50 text-amber-700",Unavailable:"bg-rose-50 text-rose-700"};
+ const cols=[{k:"id",h:"Resource ID"},{k:"name",h:"Resource",r:o=><b>{o.name}</b>,filter:1},{k:"type",h:"Type",filter:1},{k:"cap",h:"Capacity"},{k:"util",h:"Utilization",r:o=><div className="flex items-center gap-2 w-28"><Bar v={o.util} c={o.util>=90?"bg-rose-500":o.util>=60?"bg-amber-500":"bg-emerald-500"}/><span className="text-xs">{o.util}%</span></div>},{k:"status",h:"Availability",filter:1,r:o=><span className={"inline-block px-2 py-0.5 rounded-full text-xs font-semibold "+SC[o.status]}>{o.status}</span>},{k:"project",h:"Project"}];
+ return <Page title="Resources" sub="Monitor capacity and utilization across projects.">
+ <div className="grid lg:grid-cols-3 gap-4 mb-4"><Dist title="Average utilization by type" unit="%" data={types.map(t=>{const a=resources.filter(r=>r.type===t);return[t,Math.round(sumBy(a,r=>r.util)/a.length)]})}/><Dist title="Availability" data={grp(resources,r=>r.status).map(([k,v])=>[k,v,k==="Available"?"#10b981":k==="Unavailable"?"#f43f5e":"#f59e0b"])}/>
+ <div className="card p-5"><h3 className="font-bold mb-3">AI Resource Recommendations</h3><ul className="space-y-3 text-sm"><li>{hot.length} resources are at 90% utilization or higher.</li><li>{top.name} ({top.id}) is the most utilized at {top.util}%.</li><li>{resources.filter(r=>r.status==="Unavailable").length} unavailable resources could delay their projects; consider redistributing.</li></ul></div></div>
+ <Table cols={cols} rows={resources}/></Page>}
+function Recs(){
+ const [done,setDone]=useState({});
+ const open=tasks.filter(t=>t.status!=="Completed");
+ const G=[["Task Recommendations",assigns.filter(a=>a.status==="Suggested").sort((a,b)=>b.score-a.score).slice(0,4).map(a=>({id:a.id,act:()=>api("/api/assignments/"+a.id,{Assignment_Status:"Assigned"},"PUT"),rec:"Assign "+((EM[a.emp]||{}).name||a.emp)+" to "+a.task,why:"Skill match "+Math.round(a.match*100)+"%, availability "+Math.round(a.av*100)+"%.",imp:"Better fit for "+((TM[a.task]||{}).name||"task"),conf:Math.round(a.score),rel:a.task,btn:"Apply"}))],
+ ["Workforce Recommendations",[...employees].sort((a,b)=>a.workload-b.workload).slice(0,3).map(e=>({id:e.id,rec:e.name+" ("+e.id+") has spare capacity",why:"Workload is "+e.workload+"% with "+e.hours+" h/day available.",imp:"Can absorb more tasks",conf:Math.min(99,e.perf+5),rel:e.dept,btn:"Assign work"}))],
+ ["Deadline Risks",open.filter(t=>days(t.deadline)>=0&&days(t.deadline)<=14&&(t.status==="Blocked"||t.status==="Pending")).sort((a,b)=>PR[a.priority]-PR[b.priority]).slice(0,4).map(t=>({id:t.id,rec:t.id+" ("+t.name+") may miss its deadline",why:t.status+" with "+days(t.deadline)+" days left.",imp:t.priority+" priority in "+t.project,conf:70+Math.max(0,14-days(t.deadline)),rel:t.project,btn:"Escalate"}))],
+ ["Resource Recommendations",[...resources].sort((a,b)=>b.util-a.util).slice(0,3).map(r=>({id:r.id,rec:r.id+" ("+r.name+") is near maximum utilization",why:"Utilization is "+r.util+"% on "+r.project+".",imp:"Rebalancing may reduce delay",conf:r.util,rel:r.project,btn:"Rebalance"}))]];
+ return <Page title="AI Recommendations" sub="Actionable recommendations generated from organizational data.">{G.map(([t,a])=><div key={t} className="mb-6"><h3 className="font-bold mb-3">{t}</h3>{a.length?<div className="grid md:grid-cols-2 gap-4">{a.map(x=><div key={x.id} className="card p-4"><div className="font-bold text-sm">{x.rec}</div><div className="text-sm text-slate-500 mt-1">{x.why}</div><div className="text-xs mt-2 text-slate-600">Impact: {x.imp} · Related: {x.rel}</div><div className="flex items-center justify-between mt-3"><div className="w-32"><div className="text-xs text-slate-500 mb-1">Confidence {x.conf}%</div><Bar v={x.conf}/></div><button disabled={done[x.id]} onClick={()=>{if(x.act)x.act().then(()=>{setDone({...done,[x.id]:1});RELOAD()}).catch(e=>alert(e.message));else setDone({...done,[x.id]:1})}} className="px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-xs font-semibold disabled:bg-emerald-600">{done[x.id]?"Done":x.btn}</button></div></div>)}</div>:<div className="card p-6 text-sm text-slate-500">No items right now.</div>}</div>)}</Page>}
+function Analytics(){
+ const pc=(n,d)=>d?Math.round(n/d*100):0;
+ const live=assigns.filter(a=>a.status!=="Rejected"),ok=pc(assigns.filter(a=>a.status==="Assigned"||a.status==="Completed").length,assigns.length),viol=pc(constraints.filter(c=>c.status==="Violated").length,constraints.length),comp=pc(tasks.filter(t=>t.status==="Completed").length,tasks.length);
+ const co=Math.round(.5*sumBy(live,a=>a.score)/live.length+.3*(100-viol)+.2*comp);
+ const depts=[...new Set(tasks.map(t=>t.dept))].sort(),types=[...new Set(constraints.map(c=>c.type))].sort(),SC={Pending:"#94a3b8","In Progress":"#4f46e5",Completed:"#10b981",Blocked:"#f43f5e",Critical:"#f43f5e",High:"#f97316",Medium:"#f59e0b",Low:"#10b981"};
+ return <Page title="Analytics" sub="Collaboration performance across tasks, people and resources.">
+ <div className="card p-5 mb-4 flex flex-wrap items-center gap-6"><Ring v={co} size={140}/><div><h3 className="font-bold">Collaboration Optimization Score</h3><p className="text-sm text-slate-500 max-w-md mt-1">Blend of assignment quality (50%), constraint compliance (30%) and task completion (20%). Date filters are not available because the workbook has no activity history.</p></div></div>
+ <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+ <Dist title="Task completion rate" unit="%" data={[["Completed",comp,"#10b981"],["Open",100-comp,"#94a3b8"]]}/>
+ <Dist title="Task status" data={grp(tasks,t=>t.status).map(([k,v])=>[k,v,SC[k]])}/>
+ <Dist title="Task priority distribution" data={["Critical","High","Medium","Low"].map(k=>[k,tasks.filter(t=>t.priority===k).length,SC[k]])}/>
+ <Dist title="Department productivity (tasks completed)" unit="%" data={depts.map(d=>{const a=tasks.filter(t=>t.dept===d);return[d,pc(a.filter(t=>t.status==="Completed").length,a.length)]})}/>
+ <Dist title="Employee workload by department (avg %)" unit="%" data={[...new Set(employees.map(e=>e.dept))].sort().map(d=>{const a=employees.filter(e=>e.dept===d);return[d,Math.round(sumBy(a,e=>e.workload)/a.length)]})}/>
+ <Dist title="Project progress by status (avg %)" unit="%" data={[...new Set(projects.map(p=>p.status))].sort().map(s=>{const a=projects.filter(p=>p.status===s);return[s,Math.round(sumBy(a,p=>p.progress)/a.length)]})}/>
+ <Dist title="Resource utilization by type (avg %)" unit="%" data={[...new Set(resources.map(r=>r.type))].sort().map(t=>{const a=resources.filter(r=>r.type===t);return[t,Math.round(sumBy(a,r=>r.util)/a.length)]})}/>
+ <Dist title={"Assignment outcomes (success "+ok+"%)"} data={grp(assigns,a=>a.status).map(([k,v])=>[k,v,k==="Rejected"?"#f43f5e":"#4f46e5"])}/>
+ <Dist title={"Constraint violation rate ("+viol+"% overall)"} unit="%" data={types.map(t=>{const a=constraints.filter(c=>c.type===t);return[t,pc(a.filter(c=>c.status==="Violated").length,a.length),"#f43f5e"]})}/></div></Page>}
+/* ---------- Employee Report ---------- */
+const nz=v=>v==null?"":String(v);
+function reportText(r){const e=r.employee,m=r.summary,L=[];
+ L.push("EMPLOYEE REPORT: "+e.name+" ("+e.employee_id+")","Generated for "+r.generated_for,"");
+ L.push("PROFILE","Department: "+e.department,"Role: "+e.role,"Team: "+e.team+" · "+e.work_mode,"Experience: "+e.experience_years+" years","Availability: "+e.availability_hours+" h/day","Workload: "+e.workload_percent+"%","Performance: "+e.performance_score+"/100","Skills: "+e.skills.join(", "),"");
+ L.push("SUMMARY",...[["Open tasks",m.open_tasks],["Completed tasks",m.completed_tasks],["Overdue tasks",m.overdue_tasks],["Due within 14 days",m.due_within_14_days],["Suggested tasks",m.suggested_tasks],["Average assignment score",m.average_assignment_score],["Projects",m.projects],["Messages sent / received",m.messages_sent+" / "+m.messages_received],["Messages awaiting action",m.messages_awaiting_action],["Meetings attended",m.meetings_attended]].map(([a,b])=>a+": "+b),"");
+ L.push("INSIGHTS",...r.insights.map(x=>"- "+x),"");
+ L.push("OPEN TASKS ("+r.current_tasks.length+")",...(r.current_tasks.length?r.current_tasks.map(t=>t.task_id+" | "+t.task+" | "+t.project+" | "+t.priority+" | "+t.status+" | due "+t.deadline+(t.constraints_violated.length?" | VIOLATIONS: "+t.constraints_violated.join("; "):"")):["None."]),"");
+ L.push("COMPLETED TASKS",...(r.completed_tasks.length?r.completed_tasks.map(t=>t.task_id+" | "+t.task+" | "+t.project):["None."]),"");
+ L.push("SUGGESTED TASKS",...(r.suggested_tasks.length?r.suggested_tasks.map(t=>t.task_id+" | "+t.task+" | score "+Math.round(t.assignment_score)):["None."]),"");
+ L.push("COMPARISON ("+r.comparison.department+", "+r.comparison.department_size+" employees)",...["workload","performance","experience","availability"].map(k=>k+": employee "+r.comparison[k].employee+" | department "+r.comparison[k].department+" | organization "+r.comparison[k].organization),"Performance rank: "+r.comparison.performance_rank+" of "+r.comparison.organization_size,"");
+ L.push("PROJECTS",...(r.projects.length?r.projects.map(p=>p.project_id+" | "+p.project+" | "+p.tasks+" task(s), "+p.open_tasks+" open"):["None."]),"");
+ L.push("RECENT MESSAGES",...(r.communications.recent.length?r.communications.recent.map(x=>x.timestamp+" | "+x.direction+" | "+x.other+" | "+x.type+" | "+x.text):["None."]),"");
+ L.push("RECENT MEETINGS",...(r.meetings.recent.length?r.meetings.recent.map(x=>x.date+" | "+x.topic+" | "+x.project):["None."]));
+ return L.join("\n")}
+const csvCell=v=>{const t=nz(v);return /[",\n]/.test(t)?'"'+t.replace(/"/g,'""')+'"':t};
+function reportCsv(r){const e=r.employee,rows=[["Section","Item","Detail 1","Detail 2","Detail 3","Detail 4"],
+ ["Profile",e.employee_id,e.name,e.department,e.role,"Workload "+e.workload_percent+"%, performance "+e.performance_score],
+ ...Object.entries(r.summary).map(([k,v])=>["Summary",k.replace(/_/g," "),v,"","",""]),
+ ...r.current_tasks.map(t=>["Open task",t.task_id,t.task,t.project,t.priority+" / "+t.status,"Due "+t.deadline]),
+ ...r.completed_tasks.map(t=>["Completed task",t.task_id,t.task,t.project,t.priority,"Due "+t.deadline]),
+ ...r.suggested_tasks.map(t=>["Suggested task",t.task_id,t.task,t.project,t.priority,"Score "+Math.round(t.assignment_score)]),
+ ...r.insights.map(x=>["Insight",x,"","","",""])];
+ return rows.map(a=>a.map(csvCell).join(",")).join("\r\n")}
+function saveFile(name,text,type){const u=URL.createObjectURL(new Blob([text],{type}));const a=document.createElement("a");a.href=u;a.download=name;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(u)}
+const CmpRow=({l,o,unit=""})=>{const mx=Math.max(1,o.employee,o.department,o.organization)*1.1;return <div className="py-2 border-b border-slate-100"><div className="flex justify-between text-sm"><span className="text-slate-500">{l}</span><span className="font-semibold">{o.employee}{unit} <span className="font-normal text-slate-400">· dept {o.department}{unit} · org {o.organization}{unit}</span></span></div>
+ <div className="mt-1.5 space-y-1">{[["Employee",o.employee,"#4f46e5"],["Department",o.department,"#94a3b8"],["Organization",o.organization,"#cbd5e1"]].map(([n,v,c])=><div key={n} className="h-1.5 rounded-full bg-slate-100"><div className="h-1.5 rounded-full" style={{width:v/mx*100+"%",background:c}}/></div>)}</div></div>};
+function EmployeeReport(){
+ const [id,setId]=useState(REPORT_EMP||""),[txt,setTxt]=useState(REPORT_EMP?(EM[REPORT_EMP]||{}).name||"":""),[res,setRes]=useState(null),[err,setErr]=useState(null),[busy,setBusy]=useState(false);
+ const list=useMemo(()=>[...employees].sort((a,b)=>a.name.localeCompare(b.name)),[]);
+ const find=v=>{const t=v.trim().toLowerCase();return list.find(e=>e.id.toLowerCase()===t||(e.name+" ("+e.id+")").toLowerCase()===t||e.name.toLowerCase()===t)};
+ const gen=(eid)=>{const k=eid||id;if(!k){setErr("Choose an employee from the list first.");return}setErr(null);setBusy(true);setRes(null);
+  api("/api/employees/"+encodeURIComponent(k)+"/report").then(r=>{setRes(r)}).catch(e=>setErr(e.message)).finally(()=>setBusy(false))};
+ useEffect(()=>{if(REPORT_EMP){gen(REPORT_EMP);REPORT_EMP=null}},[]);
+ const pick=v=>{setTxt(v);const e=find(v);setId(e?e.id:"");setErr(null)};
+ const e=res&&res.employee,m=res&&res.summary,safe=e&&e.name.replace(/[^\w-]+/g,"_");
+ const stat=(l,v,tone)=><div key={l} className="card p-3"><div className="text-xs text-slate-500 font-medium">{l}</div><div className={"text-2xl font-extrabold mt-0.5 "+(tone||"")}>{v}</div></div>;
+ return <Page title="Employee Report" sub="Generate a full report for any employee: profile, workload, tasks, projects, communication and insights.">
+  <div className="card p-4 mb-4 noprint"><div className="flex flex-wrap items-end gap-3"><div className="flex-1 min-w-[240px]"><label htmlFor="rep-emp" className="text-sm font-semibold block mb-1">Employee</label>
+   <input id="rep-emp" list="rep-emps" className={inp+" w-full"} placeholder="Type a name or ID, e.g. Aarav Sharma or E001" value={txt} onChange={ev=>pick(ev.target.value)} onKeyDown={ev=>{if(ev.key==="Enter")gen()}}/>
+   <datalist id="rep-emps">{list.map(x=><option key={x.id} value={x.name+" ("+x.id+")"}>{x.dept+" · "+x.role}</option>)}</datalist></div>
+   <button onClick={()=>gen()} disabled={busy} className="px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700 disabled:opacity-40">{busy?"Generating…":"Generate report"}</button></div>
+   {txt&&!id&&<p className="text-xs text-amber-700 mt-2">No employee matches "{txt}". Pick one from the suggestions.</p>}</div>
+  {err&&<div role="alert" className="mb-4 p-4 rounded-xl bg-rose-50 text-rose-800 text-sm flex items-start gap-3"><span className="font-bold">!</span><div className="flex-1">{err}</div><button aria-label="Dismiss" className="text-rose-500 text-lg leading-none" onClick={()=>setErr(null)}>×</button></div>}
+  {!res&&!busy&&!err&&<div className="card p-10 text-center text-sm text-slate-500">Choose an employee above to see their report.</div>}
+  {busy&&<div className="card p-6 text-sm text-slate-500" role="status">Building the report…</div>}
+  {res&&<div>
+   <div className="card p-5 mb-4 bg-gradient-to-r from-indigo-50 to-white"><div className="flex flex-wrap items-start justify-between gap-3"><div><div className="text-xs font-bold text-indigo-700 uppercase tracking-wide">Employee report · {res.generated_for}</div><h2 className="text-2xl font-extrabold mt-1">{e.name}</h2><div className="text-sm text-slate-600">{e.employee_id} · {e.role} · {e.department} · Team {e.team} · {e.work_mode}</div></div>
+    <div className="flex flex-wrap gap-2 noprint"><button onClick={()=>window.print()} className="px-3 py-2 rounded-lg border bg-white text-sm font-semibold">Print / Save as PDF</button><button onClick={()=>saveFile(safe+"-report.txt",reportText(res),"text/plain")} className="px-3 py-2 rounded-lg border bg-white text-sm font-semibold">Download .txt</button><button onClick={()=>saveFile(safe+"-report.csv","\ufeff"+reportCsv(res),"text/csv")} className="px-3 py-2 rounded-lg border bg-white text-sm font-semibold">Download .csv</button></div></div>
+    <div className="mt-3"><Chips a={e.skills}/></div></div>
+   <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-4">{[stat("Open tasks",m.open_tasks),stat("Completed",m.completed_tasks,"text-emerald-600"),stat("Overdue",m.overdue_tasks,m.overdue_tasks?"text-rose-600":""),stat("Due in 14 days",m.due_within_14_days,m.due_within_14_days?"text-amber-600":""),stat("Avg assignment score",m.average_assignment_score),stat("Performance",e.performance_score+"/100")]}</div>
+   <div className="grid lg:grid-cols-3 gap-4 mb-4"><div className="card p-5 lg:col-span-2"><h3 className="font-bold mb-3">Insights</h3><ul className="space-y-2.5">{res.insights.map(x=><li key={x} className="flex gap-2 text-sm"><span className="mt-1.5 w-2 h-2 rounded-full bg-indigo-500 shrink-0"/>{x}</li>)}</ul><p className="text-xs text-slate-400 mt-3">Generated by rules from stored data, no language model.</p></div>
+    <div className="card p-5"><h3 className="font-bold mb-2">Profile</h3><Row l="Experience">{e.experience_years} years</Row><Row l="Availability">{e.availability_hours} h/day</Row><Row l="Workload"><Load v={e.workload_percent}/></Row><Row l="Free for new task">{e.free?<span className="text-emerald-700">Yes</span>:<span className="text-amber-700">No</span>}</Row><Row l="Assignments">{m.total_assignments}</Row></div></div>
+   <div className="grid lg:grid-cols-3 gap-4 mb-4"><div className="card p-5 lg:col-span-2 overflow-x-auto"><h3 className="font-bold mb-3">Open tasks <span className="text-xs font-semibold text-slate-400">{res.current_tasks.length}</span></h3>
+    {res.current_tasks.length?<table className="w-full text-sm"><thead><tr className="text-left text-slate-500"><th className="pr-3 pb-2">Task</th><th className="pr-3 pb-2">Project</th><th className="pr-3 pb-2">Priority</th><th className="pr-3 pb-2">Status</th><th className="pr-3 pb-2">Deadline</th><th className="pb-2">Constraints</th></tr></thead><tbody>{res.current_tasks.map(t=><tr key={t.assignment_id} className="border-t border-slate-100"><td className="py-2 pr-3"><b>{t.task_id}</b> {t.task}</td><td className="pr-3 whitespace-nowrap">{t.project}</td><td className="pr-3"><Badge v={t.priority}/></td><td className="pr-3"><Badge v={t.status}/></td><td className="pr-3 whitespace-nowrap">{t.deadline}{t.days_left<0&&<span className="text-rose-600 text-xs font-semibold"> · {-t.days_left}d overdue</span>}</td><td>{t.constraints_violated.length?<span className="text-amber-700 text-xs font-semibold" title={t.constraints_violated.join("; ")}>{t.constraints_violated.length} violated</span>:<span className="text-emerald-700 text-xs font-semibold">OK</span>}</td></tr>)}</tbody></table>:<p className="text-sm text-slate-500">No open tasks. This employee is not working on anything right now.</p>}</div>
+    <div className="card p-5"><h3 className="font-bold mb-2">Compared with {res.comparison.department}</h3><CmpRow l="Workload" o={res.comparison.workload} unit="%"/><CmpRow l="Performance" o={res.comparison.performance}/><CmpRow l="Experience (yrs)" o={res.comparison.experience}/><CmpRow l="Availability (h/day)" o={res.comparison.availability}/><p className="text-xs text-slate-500 mt-3">Performance rank {res.comparison.performance_rank} of {res.comparison.organization_size}. Department has {res.comparison.department_size} employees.</p></div></div>
+   <div className="grid md:grid-cols-2 gap-4 mb-4"><div className="card p-5"><h3 className="font-bold mb-2">Completed tasks</h3><Mini rows={res.completed_tasks.map(t=>[t.assignment_id,t.task_id+" · "+t.task,<span className="text-slate-500">{t.project}</span>])}/></div>
+    <div className="card p-5"><h3 className="font-bold mb-2">Suggested tasks</h3><Mini rows={res.suggested_tasks.map(t=>[t.assignment_id,t.task_id+" · "+t.task,<b>{Math.round(t.assignment_score)}</b>])}/></div>
+    <div className="card p-5"><h3 className="font-bold mb-2">Projects ({res.projects.length})</h3><Mini rows={res.projects.map(p=>[p.project_id,p.project_id+" · "+p.project,<span className="text-slate-500">{p.tasks} task(s), {p.open_tasks} open</span>])}/></div>
+    <div className="card p-5"><h3 className="font-bold mb-2">Meetings ({res.meetings.total})</h3><Mini rows={res.meetings.recent.map(x=>[x.meeting_id,x.topic+" · "+x.project,<span className="text-slate-500">{x.date}</span>])}/></div></div>
+   <div className="card p-5"><h3 className="font-bold mb-1">Communication</h3><p className="text-xs text-slate-500 mb-3">{res.communications.sent} sent · {res.communications.received} received · {res.communications.awaiting_action} awaiting action</p>
+    {res.communications.recent.length?<div className="space-y-2">{res.communications.recent.map(x=><div key={x.message_id} className="text-sm p-3 rounded-lg bg-slate-50"><div className="flex flex-wrap justify-between gap-2 text-xs text-slate-500"><span><b className="text-slate-700">{x.direction}</b> {x.direction==="Sent"?"to":"from"} {x.other} · {x.type} · {x.project}</span><span>{x.timestamp}</span></div><div className="mt-1">{x.text}</div></div>)}</div>:<p className="text-sm text-slate-500">No messages on record.</p>}</div>
+  </div>}
+ </Page>}
+const Soon=({t})=><Page title={t} sub="Configure organization, notification and AI preferences."><div className="card p-12 text-center text-slate-500 text-sm max-w-xl">Settings are read-only in this demo. Connect a backend to store organization, notification, AI and constraint-rule preferences.</div></Page>;
+class Boundary extends React.Component{constructor(p){super(p);this.state={e:null}}static getDerivedStateFromError(e){return{e}}render(){return this.state.e?<div className="card p-8 m-6 text-sm"><b>Something went wrong loading this page.</b><div className="text-slate-500 mt-2">{String(this.state.e.message||this.state.e)}</div><button className="mt-4 px-3 py-2 rounded-lg border" onClick={()=>this.setState({e:null})}>Try again</button></div>:this.props.children}}
+
+/* ---------- Report Summarizer ---------- */
+const SUM_SECTIONS=[["key_points","Key points"],["findings","Important findings"],["statistics","Statistics"],["conclusions","Conclusions"],["recommendations","Recommendations"]];
+const fmtSize=b=>b>=1048576?(b/1048576).toFixed(1)+" MB":Math.max(1,Math.round(b/1024))+" KB";
+function summaryText(r){const m=r.meta;return [m.filename+" - summary","","Overview",r.overview,...SUM_SECTIONS.flatMap(([k,t])=>r[k].length?["",t,...r[k].map(x=>"- "+x)]:[])].join("\n")}
+function Summarizer(){
+ const [cfg,setCfg]=useState(null),[file,setFile]=useState(null),[mode,setMode]=useState("auto"),[phase,setPhase]=useState("idle"),[pct,setPct]=useState(0),[err,setErr]=useState(null),[res,setRes]=useState(null),[drag,setDrag]=useState(false),[copied,setCopied]=useState(false);
+ const xhr=React.useRef(null),input=React.useRef(null);
+ useEffect(()=>{api("/api/reports/config").then(setCfg).catch(e=>setErr(e.message));return()=>{if(xhr.current)xhr.current.abort()}},[]);
+ const busy=phase==="uploading"||phase==="analyzing";
+ const choose=f=>{setErr(null);setRes(null);setFile(null);if(!f)return;
+  const ext=(f.name.match(/\.[^.]+$/)||[""])[0].toLowerCase();
+  if(ext===".doc")return setErr("Legacy .doc files are not supported. Save the file as .docx and try again.");
+  if(![".pdf",".docx",".txt"].includes(ext))return setErr("Unsupported file type"+(ext?" ("+ext+")":"")+". Upload a PDF, DOCX or TXT file.");
+  if(f.size===0)return setErr("That file is empty.");
+  if(cfg&&f.size>cfg.max_bytes)return setErr("That file is "+fmtSize(f.size)+". The limit is "+cfg.max_mb+" MB.");
+  setFile(f)};
+ const run=()=>{if(!file||busy)return;const x=new XMLHttpRequest();xhr.current=x;
+  x.open("POST",BASE_URL+"/api/reports/summarize?mode="+mode);x.timeout=240000;
+  x.setRequestHeader("Content-Type","application/octet-stream");x.setRequestHeader("X-File-Name",encodeURIComponent(file.name));
+  x.upload.onprogress=e=>{if(e.lengthComputable)setPct(Math.round(e.loaded/e.total*100))};
+  x.upload.onload=()=>setPhase("analyzing");
+  x.onload=()=>{let j={};try{j=JSON.parse(x.responseText)}catch(_){}
+   if(x.status>=200&&x.status<300&&j.overview){setRes(j);setPhase("done")}else{setErr((j.error&&j.error.message)||"The server could not summarize this file (error "+x.status+").");setPhase("idle")}};
+  x.onerror=()=>{setErr("Could not reach the ECOS server. Check that it is running and try again.");setPhase("idle")};
+  x.ontimeout=()=>{setErr("The request took too long. Try a smaller file or try again.");setPhase("idle")};
+  x.onabort=()=>setPhase("idle");
+  setErr(null);setRes(null);setPct(0);setPhase("uploading");x.send(file)};
+ const cancel=()=>{if(xhr.current)xhr.current.abort()};
+ const copy=()=>{const t=summaryText(res);const done=()=>{setCopied(true);setTimeout(()=>setCopied(false),1800)};
+  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(t).then(done).catch(()=>setErr("Copy was blocked by the browser. Use Download instead."));else setErr("Copy is not available in this browser. Use Download instead.")};
+ const download=()=>{const u=URL.createObjectURL(new Blob([summaryText(res)],{type:"text/plain"}));const a=document.createElement("a");a.href=u;a.download=res.meta.filename.replace(/\.[^.]+$/,"")+"-summary.txt";document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(u)};
+ const reset=()=>{setRes(null);setFile(null);setErr(null);setPhase("idle");if(input.current)input.current.value=""};
+ const ai=cfg&&cfg.ai_available;
+ return <Page title="Report Summarizer" sub="Upload a report and get an overview, key points, findings, statistics, conclusions and recommendations.">
+ {!res&&<div className="card p-5 mb-4">
+  <div onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);if(!busy)choose(e.dataTransfer.files[0])}}
+   className={"rounded-xl border-2 border-dashed p-8 text-center transition-colors "+(drag?"border-indigo-400 bg-indigo-50":"border-slate-200 bg-slate-50/60")}>
+   <div className="mx-auto w-11 h-11 rounded-full bg-indigo-50 text-indigo-600 flex items-center justify-center mb-3"><Ic d="M12 16V4M7 9l5-5 5 5M4 20h16"/></div>
+   <div className="font-semibold">Drag a report here, or</div>
+   <input ref={input} id="report-file" type="file" accept=".pdf,.docx,.txt" className="sr-only" disabled={busy} onChange={e=>choose(e.target.files[0])}/>
+   <label htmlFor="report-file" className={"inline-block mt-2 px-4 py-2 rounded-lg border border-indigo-200 text-indigo-700 text-sm font-semibold "+(busy?"opacity-40":"cursor-pointer hover:bg-indigo-50")}>Choose a file</label>
+   <p className="text-xs text-slate-500 mt-3">PDF, DOCX or TXT · up to {cfg?cfg.max_mb:10} MB · text-based files only (scanned images are not read)</p></div>
+  {file&&<div className="mt-4 flex flex-wrap items-center gap-3 text-sm"><span className="px-3 py-1.5 rounded-lg bg-indigo-50 text-indigo-800 font-semibold break-all">{file.name} <span className="font-normal text-indigo-600">· {fmtSize(file.size)}</span></span>{!busy&&<button className="text-slate-500 underline" onClick={reset}>Remove</button>}</div>}
+  <div className="mt-4 flex flex-wrap items-center gap-3"><label className="text-sm font-semibold" htmlFor="sum-mode">Summary engine</label>
+   <select id="sum-mode" className={inp} value={mode} disabled={busy} onChange={e=>setMode(e.target.value)}><option value="auto">{ai?"Automatic (AI model)":"Automatic (built-in NLP)"}</option><option value="local">Built-in NLP only</option>{ai&&<option value="ai">AI model only</option>}</select>
+   <div className="ml-auto flex gap-2"><button onClick={run} disabled={!file||busy||!cfg} className="px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700 disabled:opacity-40">Summarize report</button>{busy&&<button onClick={cancel} className="px-4 py-2 rounded-lg border text-sm font-semibold">Cancel</button>}</div></div>
+  <p className="text-xs text-slate-500 mt-3">{mode==="local"||!ai?"Processed on your ECOS server with the built-in summarizer. The report is not sent to any outside service.":"AI mode sends the report text to the "+cfg.ai_model+" model (Anthropic API) after masking emails, phone numbers and ID numbers. Choose “Built-in NLP only” to keep everything on this server."} Files are processed in memory and are not stored.</p>
+ </div>}
+ {busy&&<div className="card p-5 mb-4" role="status" aria-live="polite"><div className="flex items-center gap-3"><svg className="w-5 h-5 animate-spin text-indigo-600" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="3" opacity=".25"/><path d="M21 12a9 9 0 00-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/></svg>
+  <div className="font-semibold text-sm">{phase==="uploading"?"Uploading… "+pct+"%":"Reading the report and writing the summary… this can take up to a minute for long files."}</div></div>
+  <div className="h-2 rounded-full bg-slate-100 mt-4 overflow-hidden"><div className={"h-2 rounded-full bg-indigo-500 "+(phase==="analyzing"?"animate-pulse w-full":"")} style={phase==="uploading"?{width:pct+"%"}:{}}/></div></div>}
+ {err&&<div role="alert" className="mb-4 p-4 rounded-xl bg-rose-50 text-rose-800 text-sm flex items-start gap-3"><span className="font-bold">!</span><div className="flex-1">{err}</div><button aria-label="Dismiss" className="text-rose-500 text-lg leading-none" onClick={()=>setErr(null)}>×</button></div>}
+ {res&&<div>
+  <div className="card p-5 mb-4 bg-gradient-to-r from-indigo-50 to-white"><div className="flex flex-wrap items-start justify-between gap-3 mb-2"><div><div className="text-xs font-bold text-indigo-700 uppercase tracking-wide">Overview</div><div className="text-sm text-slate-500 break-all">{res.meta.filename}</div></div>
+   <div className="flex flex-wrap gap-2 text-xs font-semibold"><span className="px-2 py-1 rounded-full bg-white border text-slate-600">{res.meta.method==="ai"?"AI · "+res.meta.model:"Built-in NLP"}</span><span className="px-2 py-1 rounded-full bg-white border text-slate-600">{res.meta.words.toLocaleString()} words · ~{res.meta.read_minutes} min read</span>{res.meta.pages&&<span className="px-2 py-1 rounded-full bg-white border text-slate-600">{res.meta.pages} pages</span>}{res.meta.masked_items>0&&<span className="px-2 py-1 rounded-full bg-white border text-slate-600">{res.meta.masked_items} private item(s) masked</span>}</div></div>
+   <p className="text-sm leading-relaxed">{res.overview}</p></div>
+  {res.meta.notes.length>0&&<div className="mb-4 p-3 rounded-xl bg-amber-50 text-amber-800 text-sm space-y-1">{res.meta.notes.map(n=><div key={n}>{n}</div>)}</div>}
+  <div className="grid md:grid-cols-2 gap-4">{SUM_SECTIONS.map(([k,t])=><div key={k} className={"card p-5 "+(k==="key_points"?"md:col-span-2":"")}><h3 className="font-bold mb-3 flex items-center gap-2">{t}<span className="text-xs font-semibold text-slate-400">{res[k].length}</span></h3>
+   {res[k].length?<ul className="list-disc pl-5 space-y-2 text-sm leading-relaxed marker:text-indigo-400">{res[k].map((x,i)=><li key={i}>{x}</li>)}</ul>:<p className="text-sm text-slate-500">Nothing in this report matched this section.</p>}</div>)}</div>
+  <div className="mt-4 flex flex-wrap gap-2"><button onClick={copy} className="px-4 py-2 rounded-lg border text-sm font-semibold">{copied?"Copied":"Copy summary"}</button><button onClick={download} className="px-4 py-2 rounded-lg border text-sm font-semibold">Download as .txt</button><button onClick={reset} className="px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700">Summarize another report</button></div>
+  <p className="text-xs text-slate-500 mt-3">Summaries can miss nuance. Check important figures against the original report.</p></div>}
+ </Page>}
+
+/* ---------- Shell ---------- */
+const NAV=[["Dashboard","M3 12l9-9 9 9M5 10v10h14V10"],["Employees","M16 11a4 4 0 10-8 0M4 21a8 8 0 0116 0"],["Projects","M3 7h18v13H3zM8 7V4h8v3"],["Tasks","M9 11l3 3 8-8M4 4h10v4"],["Task Optimization","M4 20V10M10 20V4M16 20v-8M22 20H2"],["CSP Constraints","M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"],["Communications","M4 5h16v11H8l-4 4z"],["Meetings","M4 6h16v14H4zM8 3v5M16 3v5"],["Resources","M4 8l8-4 8 4-8 4zM4 8v8l8 4 8-4V8"],["AI Recommendations","M12 3l2 6 6 2-6 2-2 6-2-6-6-2 6-2z"],["Employee Report","M6 3h9l4 4v14H6zM15 3v4h4M9 13h7M9 17h7M9 9h3"],["Report Summarizer","M7 3h7l5 5v13H7zM14 3v5h5M10 13h6M10 17h6"],["Analytics","M4 19l5-6 4 3 7-9"],["Settings","M12 15a3 3 0 100-6 3 3 0 000 6zM19 12h2M3 12h2M12 3v2M12 19v2"]];
+function App(){
+ const [p,setP]=useState("Dashboard");const [col,setCol]=useState(false);const [mob,setMob]=useState(false);const [ready,setReady]=useState(false),[loadErr,setLoadErr]=useState(null),[,setVer]=useState(0);const loadAll=()=>api("/api/bootstrap").then(d=>{load(d);setReady(true);setLoadErr(null);setVer(v=>v+1)}).catch(e=>setLoadErr(e.message));RELOAD=loadAll;GOTO=setP;useEffect(()=>{loadAll()},[]);
+ const view={Dashboard:<Dashboard/>,Employees:<Employees/>,Projects:<Projects/>,Tasks:<Tasks/>,"Task Optimization":<Optimize/>,"CSP Constraints":<CSP/>,Communications:<Comms/>,Meetings:<Meetings/>,Resources:<Resources/>,"AI Recommendations":<Recs/>,"Employee Report":<EmployeeReport/>,"Report Summarizer":<Summarizer/>,Analytics:<Analytics/>}[p]||<Soon t={p}/>;
+ if(!ready)return <div className="h-full flex items-center justify-center p-6"><div className="card p-8 max-w-md text-center"><div className="flex justify-center mb-3"><Logo/></div>{loadErr?<><div className="font-bold">Cannot reach the ECOS server</div><p className="text-sm text-slate-500 mt-2">{loadErr}. Start the backend with <code>python server.py</code> and open http://localhost:8000.</p><button className="mt-4 px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold" onClick={loadAll}>Retry</button></>:<div className="text-sm text-slate-500">Loading ECOS data…</div>}</div></div>;
+ return <div className="flex h-full">
+ {mob&&<div className="fixed inset-0 bg-slate-900/30 z-20 md:hidden" onClick={()=>setMob(false)}/>}
+ <aside className={"bg-white border-r border-slate-200 flex flex-col z-30 fixed md:static inset-y-0 left-0 transition-[width] "+(col?"md:w-[68px]":"md:w-64")+" w-64 "+(mob?"":"-translate-x-full md:translate-x-0")}>
+ <div className="flex items-center gap-3 p-4"><Logo/>{!col&&<div><div className="font-extrabold leading-tight">ECOS</div><div className="text-[10px] text-slate-500 leading-tight">Enterprise Collaboration<br/>Optimization System</div></div>}</div>
+ <nav className="flex-1 overflow-y-auto px-2 space-y-0.5">{NAV.map(([n,d])=><button key={n} title={n} onClick={()=>{setP(n);setMob(false)}} className={"w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-semibold text-left "+(p===n?"bg-indigo-50 text-indigo-700":"text-slate-600 hover:bg-slate-50")}><Ic d={d} c="w-5 h-5 shrink-0"/>{!col&&n}</button>)}</nav>
+ <button onClick={()=>setCol(!col)} className="hidden md:block mx-2 my-1 px-3 py-2 text-xs text-slate-500 hover:bg-slate-50 rounded-lg text-left">{col?"»":"« Collapse"}</button>
+ <div className="p-3 border-t border-slate-100 flex items-center gap-3"><div className="w-9 h-9 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-sm shrink-0">MB</div>{!col&&<div><div className="text-sm font-bold leading-tight">Manvi Bansal</div><div className="text-xs text-slate-500">Project Administrator</div></div>}</div></aside>
+ <div className="flex-1 min-w-0 flex flex-col"><header className="h-14 bg-white border-b border-slate-200 flex items-center gap-3 px-4"><button className="md:hidden text-xl" aria-label="Menu" onClick={()=>setMob(true)}>☰</button><div className="text-sm text-slate-500 hidden sm:block">AI-powered task, resource and collaboration optimization</div><input className={inp+" ml-auto w-44 sm:w-64"} placeholder="Search ECOS…"/></header>
+ <main className="flex-1 overflow-y-auto p-4 md:p-6"><div className="max-w-7xl mx-auto"><Boundary key={p}>{view}</Boundary></div></main></div></div>}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script></body></html>
