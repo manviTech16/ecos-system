@@ -796,7 +796,9 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if not os.path.exists(DB):
         sys.exit(f"Database not found at {DB}. Run: python import_excel.py")
-    host, port = os.environ.get("HOST", "127.0.0.1"), int(os.environ.get("PORT") or (sys.argv[1] if len(sys.argv) > 1 else 8000))
+    
+host, port = os.environ.get("HOST", "0.0.0.0"), int(os.environ.get("PORT") or (sys.argv[1] if len(sys.argv) > 1 else 8000))
+
     srv = ThreadingHTTPServer((host, port), Handler)
     print(f"ECOS running at http://{'localhost' if host == '127.0.0.1' else host}:{port}  (API under /api, database {DB})")
     try:
